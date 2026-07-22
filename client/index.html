@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Near-realtime Whisper</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; padding: 2rem;
+    font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    max-width: 46rem; margin-inline: auto;
+  }
+  header { display: flex; align-items: center; gap: 1rem; margin-bottom: 1.5rem; }
+  h1 { font-size: 1.1rem; margin: 0; font-weight: 600; }
+  button {
+    font: inherit; padding: .5rem 1.1rem; border-radius: 999px;
+    border: 1px solid currentColor; background: transparent; cursor: pointer;
+  }
+  button[data-recording="true"] { background: #d33; border-color: #d33; color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  #status { font-size: .85rem; opacity: .65; font-variant-numeric: tabular-nums; }
+  #transcript { font-size: 1.15rem; white-space: pre-wrap; }
+  #transcript p { margin: 0 0 1rem; }
+  .pending { opacity: .45; font-style: italic; }
+  footer { margin-top: 2rem; font-size: .8rem; opacity: .6; }
+</style>
+</head>
+<body>
+<header>
+  <button id="toggle">Start</button>
+  <h1>Near-realtime Whisper</h1>
+  <span id="status">idle</span>
+</header>
+
+<div id="transcript"><p id="current"><span class="committed"></span><span class="pending"></span></p></div>
+
+<footer>Solid text is committed. Grey italic text is the unstable hypothesis and may change.</footer>
+
+<script>
+const TARGET_RATE = 16000;
+
+const toggle = document.getElementById('toggle');
+const statusEl = document.getElementById('status');
+const transcript = document.getElementById('transcript');
+let current = document.getElementById('current');
+
+let ws = null, ctx = null, node = null, stream = null;
+let firstTextAt = null, startedAt = null;
+
+function setStatus(text) { statusEl.textContent = text; }
+
+function newParagraph() {
+  const p = document.createElement('p');
+  p.innerHTML = '<span class="committed"></span><span class="pending"></span>';
+  transcript.appendChild(p);
+  current = p;
+}
+
+function render(msg) {
+  const committed = current.querySelector('.committed');
+  const pending = current.querySelector('.pending');
+
+  if (msg.commit) {
+    // Append-only delta.
+    committed.textContent += (committed.textContent ? ' ' : '') + msg.commit.text;
+  }
+  // Replace semantics.
+  pending.textContent = msg.pending ? (committed.textContent ? ' ' : '') + msg.pending : '';
+
+  if (firstTextAt === null && (msg.commit || msg.pending)) {
+    firstTextAt = performance.now();
+    setStatus(`first text in ${Math.round(firstTextAt - startedAt)} ms`);
+  }
+  if (msg.endOfSegment && committed.textContent.trim()) {
+    pending.textContent = '';
+    newParagraph();
+  }
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+async function start() {
+  startedAt = performance.now();
+  firstTextAt = null;
+  setStatus('connecting…');
+
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: true }
+  });
+
+  // Ask for 16 kHz directly; the browser resamples the mic better than we can.
+  // The worklet falls back to its own downsampler if the request isn't honoured.
+  try { ctx = new AudioContext({ sampleRate: TARGET_RATE }); }
+  catch { ctx = new AudioContext(); }
+  await ctx.resume();
+  await ctx.audioWorklet.addModule('audio-worklet.js');
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({
+      type: 'start',
+      sampleRate: TARGET_RATE,
+      encoding: 'pcm_s16le',
+      language: 'en'
+    }));
+  };
+
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    switch (msg.type) {
+      case 'ready':
+        setStatus('listening…');
+        break;
+      case 'transcript':
+        render(msg);
+        break;
+      case 'done':
+        setStatus('done');
+        break;
+      case 'error':
+        setStatus(`error: ${msg.code}`);
+        console.error(msg);
+        break;
+    }
+  };
+
+  ws.onclose = () => stop(true);
+  ws.onerror = () => setStatus('connection error');
+
+  const source = ctx.createMediaStreamSource(stream);
+  node = new AudioWorkletNode(ctx, 'capture-processor', {
+    numberOfInputs: 1,
+    numberOfOutputs: 0,
+    processorOptions: { targetRate: TARGET_RATE, frameSamples: 2048 } // ~128 ms
+  });
+  node.port.onmessage = (ev) => {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(ev.data.buffer ?? ev.data);
+  };
+  source.connect(node);
+
+  toggle.textContent = 'Stop';
+  toggle.dataset.recording = 'true';
+}
+
+function stop(fromClose) {
+  toggle.textContent = 'Start';
+  toggle.dataset.recording = 'false';
+
+  if (node) { node.port.postMessage('stop'); node.disconnect(); node = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (ctx) { ctx.close(); ctx = null; }
+  if (ws && !fromClose && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'stop' }));
+  }
+  if (!fromClose) setStatus('stopping…');
+}
+
+toggle.onclick = async () => {
+  if (toggle.dataset.recording === 'true') { stop(false); return; }
+  toggle.disabled = true;
+  try { await start(); }
+  catch (e) { setStatus(`mic error: ${e.message}`); console.error(e); }
+  finally { toggle.disabled = false; }
+};
+</script>
+</body>
+</html>
