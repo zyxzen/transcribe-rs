@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use axum::body::{Body, Bytes};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -44,12 +45,14 @@ where
                 .delete(delete_session),
         )
         .route("/sessions/{id}/export/{format}", get(export_session))
+        .fallback(|| async { ApiError::NotFound })
         .with_state(state)
 }
 
 #[derive(Debug)]
 pub enum ApiError {
     NotFound,
+    BadRequest(String),
     Conflict(&'static str, &'static str),
     Unprocessable(&'static str, String),
     Internal(anyhow::Error),
@@ -64,11 +67,8 @@ impl<E: Into<anyhow::Error>> From<E> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, code, message) = match self {
-            ApiError::NotFound => (
-                StatusCode::NOT_FOUND,
-                "not_found",
-                "no such session".to_string(),
-            ),
+            ApiError::NotFound => (StatusCode::NOT_FOUND, "not_found", "not found".to_string()),
+            ApiError::BadRequest(message) => (StatusCode::BAD_REQUEST, "bad_request", message),
             ApiError::Conflict(code, message) => (StatusCode::CONFLICT, code, message.to_string()),
             ApiError::Unprocessable(code, message) => {
                 (StatusCode::UNPROCESSABLE_ENTITY, code, message)
@@ -88,6 +88,11 @@ impl IntoResponse for ApiError {
         )
             .into_response()
     }
+}
+
+/// Extractor rejections carry axum's own text; surface it in the JSON contract.
+fn bad_request(e: impl std::fmt::Display) -> ApiError {
+    ApiError::BadRequest(e.to_string())
 }
 
 type ApiResult<T> = Result<T, ApiError>;
@@ -143,8 +148,9 @@ struct RenameBody {
 
 async fn list_sessions(
     State(st): State<ApiState>,
-    Query(params): Query<ListParams>,
+    params: Result<Query<ListParams>, QueryRejection>,
 ) -> ApiResult<Json<Vec<SessionSummary>>> {
+    let Query(params) = params.map_err(bad_request)?;
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let items = db::list_sessions(&st.db, params.before, limit).await?;
     Ok(Json(
@@ -170,8 +176,9 @@ async fn load(st: &ApiState, id: Uuid) -> ApiResult<SessionView> {
 
 async fn get_session(
     State(st): State<ApiState>,
-    Path(id): Path<Uuid>,
+    id: Result<Path<Uuid>, PathRejection>,
 ) -> ApiResult<Json<SessionDetail>> {
+    let Path(id) = id.map_err(bad_request)?;
     let session = load(&st, id).await?;
     let recordings = db::list_recordings(&st.db, id).await?;
     let paragraphs = export::paragraphs(&db::list_chunks(&st.db, id).await?)
@@ -192,9 +199,11 @@ async fn get_session(
 
 async fn rename_session(
     State(st): State<ApiState>,
-    Path(id): Path<Uuid>,
-    Json(body): Json<RenameBody>,
+    id: Result<Path<Uuid>, PathRejection>,
+    body: Result<Json<RenameBody>, JsonRejection>,
 ) -> ApiResult<Json<SessionView>> {
+    let Path(id) = id.map_err(bad_request)?;
+    let Json(body) = body.map_err(bad_request)?;
     let title = body
         .title
         .as_deref()
@@ -215,7 +224,11 @@ async fn rename_session(
     }))
 }
 
-async fn delete_session(State(st): State<ApiState>, Path(id): Path<Uuid>) -> ApiResult<StatusCode> {
+async fn delete_session(
+    State(st): State<ApiState>,
+    id: Result<Path<Uuid>, PathRejection>,
+) -> ApiResult<StatusCode> {
+    let Path(id) = id.map_err(bad_request)?;
     // Holding the claim while deleting stops a reconnect from resuming a
     // session that is halfway gone.
     let Some(_guard) = st.live.try_claim(id) else {
@@ -233,8 +246,9 @@ async fn delete_session(State(st): State<ApiState>, Path(id): Path<Uuid>) -> Api
 
 async fn export_session(
     State(st): State<ApiState>,
-    Path((id, format)): Path<(Uuid, String)>,
+    path: Result<Path<(Uuid, String)>, PathRejection>,
 ) -> ApiResult<Response> {
+    let Path((id, format)) = path.map_err(bad_request)?;
     if !matches!(format.as_str(), "txt" | "srt" | "vtt" | "json" | "wav") {
         return Err(ApiError::NotFound);
     }
@@ -680,5 +694,152 @@ mod tests {
         assert_eq!(body.len(), 44);
         let (_, _, body) = call(&f.app, "GET", &format!("/sessions/{sid}/export/txt"), None).await;
         assert!(body.is_empty());
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn wav_concatenates_recordings_in_order(pool: PgPool) {
+        let f = fixture(pool);
+        let sid = Uuid::now_v7();
+        db::create_session(&f.pool, sid, "en").await.unwrap();
+        for (fill, len) in [(1u8, 640usize), (2u8, 320usize)] {
+            let r = db::begin_recording(&f.pool, sid, Uuid::now_v7(), 16_000)
+                .await
+                .unwrap();
+            let path = sessions::recording_path(f.dir.path(), sid, r.recording.id);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(&path, vec![fill; len]).await.unwrap();
+            db::finish_recording(&f.pool, r.recording.id, (len / 32) as i64)
+                .await
+                .unwrap();
+        }
+        let (_, _, body) = call(&f.app, "GET", &format!("/sessions/{sid}/export/wav"), None).await;
+        assert_eq!(body.len(), 44 + 960);
+        assert!(body[44..44 + 640].iter().all(|&b| b == 1));
+        assert!(body[44 + 640..].iter().all(|&b| b == 2));
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn wav_rejects_mixed_sample_rates(pool: PgPool) {
+        let f = fixture(pool);
+        let sid = seed(&f.pool, f.dir.path(), None).await;
+        let r = db::begin_recording(&f.pool, sid, Uuid::now_v7(), 48_000)
+            .await
+            .unwrap();
+        db::finish_recording(&f.pool, r.recording.id, 0)
+            .await
+            .unwrap();
+        let (status, _, body) =
+            call(&f.app, "GET", &format!("/sessions/{sid}/export/wav"), None).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(json(&body)["error"]["code"], "mixed_sample_rates");
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn wav_skips_recording_with_missing_file(pool: PgPool) {
+        let f = fixture(pool);
+        let sid = seed(&f.pool, f.dir.path(), None).await;
+        let rec = &db::list_recordings(&f.pool, sid).await.unwrap()[0];
+        tokio::fs::remove_file(sessions::recording_path(f.dir.path(), sid, rec.id))
+            .await
+            .unwrap();
+        let (status, _, body) =
+            call(&f.app, "GET", &format!("/sessions/{sid}/export/wav"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.len(), 44);
+    }
+
+    /// Runs `uri` while a row lock stalls the handler inside its database
+    /// work, and checks the session stays claimed for that whole time.
+    async fn assert_claimed_while_blocked(
+        f: &Fixture,
+        sid: Uuid,
+        method: &'static str,
+        uri: String,
+    ) {
+        let mut tx = f.pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM sessions WHERE id = $1 FOR UPDATE")
+            .bind(sid)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        let app = f.app.clone();
+        let handle = tokio::spawn(async move { call(&app, method, &uri, None).await.0 });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !handle.is_finished(),
+            "handler should be stalled on the row lock"
+        );
+        assert!(
+            f.live.is_live(sid),
+            "claim must be held while the handler works"
+        );
+        tx.commit().await.unwrap();
+        assert!(handle.await.unwrap().is_success());
+        assert!(!f.live.is_live(sid), "claim released afterwards");
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn export_holds_claim_during_repair(pool: PgPool) {
+        let f = fixture(pool);
+        let sid = seed(&f.pool, f.dir.path(), None).await;
+        let r = db::begin_recording(&f.pool, sid, Uuid::now_v7(), 16_000)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            sessions::recording_path(f.dir.path(), sid, r.recording.id),
+            vec![0u8; 3_200],
+        )
+        .await
+        .unwrap();
+        assert_claimed_while_blocked(&f, sid, "GET", format!("/sessions/{sid}/export/wav")).await;
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn delete_holds_claim_while_deleting(pool: PgPool) {
+        let f = fixture(pool);
+        let sid = seed(&f.pool, f.dir.path(), None).await;
+        assert_claimed_while_blocked(&f, sid, "DELETE", format!("/sessions/{sid}")).await;
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn bad_input_gets_json_errors(pool: PgPool) {
+        let f = fixture(pool);
+        let sid = seed(&f.pool, f.dir.path(), None).await;
+        for (method, uri, body) in [
+            ("GET", "/sessions/not-a-uuid".to_string(), None),
+            ("DELETE", "/sessions/not-a-uuid".to_string(), None),
+            ("GET", "/sessions/not-a-uuid/export/txt".to_string(), None),
+            ("GET", "/sessions?before=nope".to_string(), None),
+            (
+                "PATCH",
+                format!("/sessions/{sid}"),
+                Some(serde_json::json!({"title": 5})),
+            ),
+        ] {
+            let (status, headers, bytes) = call(&f.app, method, &uri, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}");
+            assert_eq!(headers["content-type"], "application/json");
+            assert_eq!(json(&bytes)["error"]["code"], "bad_request");
+        }
+        // Not JSON at all (no content-type, plain text body).
+        let req = Request::builder()
+            .method("PATCH")
+            .uri(format!("/sessions/{sid}"))
+            .body(Body::from("hi"))
+            .unwrap();
+        let res = f.app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(json(&bytes)["error"]["code"], "bad_request");
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn unknown_route_is_json_404(pool: PgPool) {
+        let f = fixture(pool);
+        let (status, _, body) = call(&f.app, "GET", "/nope", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json(&body)["error"]["code"], "not_found");
     }
 }
