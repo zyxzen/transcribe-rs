@@ -1,3 +1,4 @@
+mod api;
 mod audio;
 mod config;
 mod db;
@@ -58,12 +59,19 @@ async fn main() -> Result<()> {
 
     let state = AppState::new(Arc::clone(&cfg), Arc::clone(&engine), db.clone());
 
+    let api = api::router(api::ApiState {
+        db: db.clone(),
+        live: state.live.clone(),
+        data_dir: cfg.data_dir.clone(),
+    });
+
     let index = cfg.client_dir.join("index.html");
     let static_files = ServeDir::new(&cfg.client_dir).fallback(ServeFile::new(index));
 
     let app = Router::new()
         .route("/ws", get(ws::handler))
         .route("/healthz", get(|| async { "ok" }))
+        .nest("/api", api)
         .fallback_service(static_files)
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
