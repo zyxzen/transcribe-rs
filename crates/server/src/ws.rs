@@ -202,13 +202,13 @@ async fn serve(socket: WebSocket, state: AppState) -> anyhow::Result<()> {
         loop {
             tokio::select! {
                 msg = out_rx.recv() => {
-                    let Some(msg) = msg else { break };
-                    let done = matches!(msg, ServerMessage::Done { .. });
-                    if send(&mut sink, &msg).await.is_err() {
-                        break;
-                    }
-                    if done {
+                    let Some(msg) = msg else {
+                        // Every producer (pipeline, recorder, receiver) is
+                        // done, so nothing more can be reported.
                         let _ = sink.send(Message::Close(None)).await;
+                        break;
+                    };
+                    if send(&mut sink, &msg).await.is_err() {
                         break;
                     }
                 }
@@ -273,8 +273,10 @@ async fn serve(socket: WebSocket, state: AppState) -> anyhow::Result<()> {
     }
 
     // Order matters: the pipeline's final flush queues its last commits to
-    // the recorder, the recorder then writes them and releases the session,
-    // and only then does the sender run dry and close the socket.
+    // the recorder and its `done` to the sender; the recorder then writes
+    // them, may report a final `persist_failed` through its `notify` clone,
+    // and releases the session. Only after that do the last `out_tx` clones
+    // drop, so the sender drains everything and then closes the socket.
     drop(audio_tx);
     let _ = pipeline_task.await;
     drop(rec_audio_tx);
