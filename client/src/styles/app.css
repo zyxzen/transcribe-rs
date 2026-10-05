@@ -326,3 +326,4 @@ a.icon-btn, a.pill { text-decoration: none; }
 .session-transcript .stamp {
   color: var(--muted); font-size: .8rem; font-variant-numeric: tabular-nums; margin-right: .6rem;
 }
+.bubble[data-notice="true"] { color: var(--danger); }

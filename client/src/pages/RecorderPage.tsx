@@ -90,6 +90,9 @@ export function RecorderPage() {
                   : 'listening…'
               : '');
 
+  // The bar is hidden while idle, so notices are shown in the splash instead.
+  const idleNotice = uiState === 'idle' ? (t.notice ?? (missing ? 'That session no longer exists.' : null)) : null;
+
   // Space toggles pause while live, start otherwise (as in the old client).
   const beginRef = useRef(begin);
   useEffect(() => {
@@ -111,7 +114,9 @@ export function RecorderPage() {
   return (
     <div className="recorder" data-state={uiState}>
       <main id="splash">
-        <div className="bubble">{showHistory && history.isLoading ? 'Loading session…' : 'Press and start talking'}</div>
+        <div className="bubble" data-notice={idleNotice !== null}>
+          {idleNotice ?? (showHistory && history.isLoading ? 'Loading session…' : 'Press and start talking')}
+        </div>
         <button className="mic-hero" id="hero" aria-label="Start transcribing" disabled={busy} onClick={() => void begin()}>
           <MicIcon />
         </button>
