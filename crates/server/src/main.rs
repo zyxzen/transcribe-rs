@@ -4,6 +4,7 @@ mod db;
 mod live;
 mod pipeline;
 mod protocol;
+mod recorder;
 mod sessions;
 mod stabilizer;
 mod vad;
