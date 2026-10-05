@@ -10,6 +10,7 @@ use sqlx::PgPool;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -47,8 +48,7 @@ pub struct Recorder {
     sample_rate: u32,
     paragraph: i32,
     paragraph_has_text: bool,
-    file: BufWriter<File>,
-    bytes_written: u64,
+    file: Option<File>,
     rows: Vec<Chunk>,
     failing: bool,
     reported: bool,
@@ -82,8 +82,7 @@ impl Recorder {
             sample_rate: opened.recording.sample_rate as u32,
             paragraph: opened.next_paragraph,
             paragraph_has_text: false,
-            file: BufWriter::new(file),
-            bytes_written: 0,
+            file: Some(file),
             rows: Vec::new(),
             failing: false,
             reported: false,
@@ -95,20 +94,21 @@ impl Recorder {
     /// Runs until both inputs close, then flushes and finishes the recording.
     pub async fn run(
         mut self,
-        mut audio: mpsc::Receiver<Bytes>,
+        audio: mpsc::Receiver<Bytes>,
         mut events: mpsc::UnboundedReceiver<RecorderEvent>,
     ) {
-        let mut audio_open = true;
-        let mut events_open = true;
-        let mut flush_at: Option<Instant> = None;
+        // Audio is drained by its own task so a slow or failing Postgres can
+        // never stall capture (and, through backpressure, transcription).
+        let file = self
+            .file
+            .take()
+            .expect("recording file is opened by create");
+        let writer = tokio::spawn(write_audio(BufWriter::new(file), audio));
 
-        while audio_open || events_open {
+        let mut flush_at: Option<Instant> = None;
+        loop {
             tokio::select! {
-                frame = audio.recv(), if audio_open => match frame {
-                    Some(bytes) => self.write_audio(&bytes).await,
-                    None => audio_open = false,
-                },
-                event = events.recv(), if events_open => match event {
+                event = events.recv() => match event {
                     Some(RecorderEvent::Commit { text, start_ms, end_ms }) => {
                         self.rows.push(Chunk {
                             paragraph: self.paragraph,
@@ -117,7 +117,8 @@ impl Recorder {
                             end_ms: self.offset_ms + end_ms as i64,
                         });
                         self.paragraph_has_text = true;
-                        if self.rows.len() >= FLUSH_ROWS {
+                        // While failing, only the retry timer touches Postgres.
+                        if self.rows.len() >= FLUSH_ROWS && !self.failing {
                             flush_at = self.flush().await;
                         } else if flush_at.is_none() {
                             flush_at = Some(Instant::now() + FLUSH_AFTER);
@@ -128,23 +129,18 @@ impl Recorder {
                             self.paragraph += 1;
                             self.paragraph_has_text = false;
                         }
-                        flush_at = self.flush().await;
+                        if !self.failing {
+                            flush_at = self.flush().await;
+                        }
                     }
-                    None => events_open = false,
+                    None => break,
                 },
                 () = sleep_until(flush_at) => {
                     flush_at = self.flush().await;
                 }
             }
         }
-        self.close().await;
-    }
-
-    async fn write_audio(&mut self, bytes: &[u8]) {
-        match self.file.write_all(bytes).await {
-            Ok(()) => self.bytes_written += bytes.len() as u64,
-            Err(e) => tracing::warn!(error = %e, "writing recording audio failed"),
-        }
+        self.close(writer).await;
     }
 
     /// Writes buffered rows. Returns when to try again if they could not be
@@ -169,8 +165,11 @@ impl Recorder {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, attempt, "persisting transcript chunks failed");
-                    if attempt + 1 < attempts {
-                        tokio::time::sleep(RETRY_BACKOFF[attempt]).await;
+                    if let Some(backoff) = RETRY_BACKOFF
+                        .get(attempt)
+                        .filter(|_| attempt + 1 < attempts)
+                    {
+                        tokio::time::sleep(*backoff).await;
                     }
                 }
             }
@@ -187,23 +186,50 @@ impl Recorder {
         Some(Instant::now() + RETRY_FAILING_EVERY)
     }
 
-    async fn close(mut self) {
+    async fn close(mut self, writer: JoinHandle<u64>) {
         // The final flush gets the full retry budget again.
         self.failing = false;
         if self.flush().await.is_some() {
             tracing::error!(rows = self.rows.len(), "dropping unsaved transcript chunks");
         }
-        if let Err(e) = self.file.flush().await {
-            tracing::warn!(error = %e, "flushing recording audio failed");
-        }
-        if let Err(e) = self.file.get_ref().sync_all().await {
-            tracing::warn!(error = %e, "syncing recording audio failed");
-        }
-        let duration_ms = sessions::pcm_duration_ms(self.bytes_written, self.sample_rate);
+        // Both inputs are closed; wait for the audio to hit the disk.
+        let bytes_written = match writer.await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!(error = %e, "recording audio writer failed");
+                0
+            }
+        };
+        let duration_ms = sessions::pcm_duration_ms(bytes_written, self.sample_rate);
         if let Err(e) = db::finish_recording(&self.pool, self.recording_id, duration_ms).await {
             tracing::warn!(error = %e, "finishing recording failed; it will be repaired on next resume");
         }
+        // `_guard` drops here, after everything is persisted.
     }
+}
+
+/// Appends every frame to the recording, never waiting on anything but the
+/// disk. Returns the bytes written once the channel closes.
+async fn write_audio(mut file: BufWriter<File>, mut audio: mpsc::Receiver<Bytes>) -> u64 {
+    let mut written = 0u64;
+    let mut warned = false;
+    while let Some(bytes) = audio.recv().await {
+        match file.write_all(&bytes).await {
+            Ok(()) => written += bytes.len() as u64,
+            Err(e) if !warned => {
+                warned = true;
+                tracing::warn!(error = %e, "writing recording audio failed");
+            }
+            Err(_) => {}
+        }
+    }
+    if let Err(e) = file.flush().await {
+        tracing::warn!(error = %e, "flushing recording audio failed");
+    }
+    if let Err(e) = file.get_ref().sync_all().await {
+        tracing::warn!(error = %e, "syncing recording audio failed");
+    }
+    written
 }
 
 async fn sleep_until(at: Option<Instant>) {
@@ -342,9 +368,11 @@ mod tests {
         for i in 0..32u64 {
             events_tx.send(commit("w", i * 10, i * 10 + 5)).unwrap();
         }
-        // Poll for the batch while the recorder is still running.
+        // Poll for the batch while the recorder is still running. The window
+        // is well under the 500 ms timer, so only the row-count trigger can
+        // satisfy it.
         let mut seen = 0;
-        for _ in 0..100 {
+        for _ in 0..30 {
             seen = db::list_chunks(&pool, sid).await.unwrap().len();
             if seen == 32 {
                 break;
@@ -390,5 +418,39 @@ mod tests {
             3_200,
             "audio is kept even when Postgres is down"
         );
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn audio_keeps_draining_while_postgres_is_failing(pool: PgPool) {
+        let dir = tempfile::tempdir().unwrap();
+        let live = LiveRegistry::default();
+        let (sid, rec_id, recorder, _notify) = start(&pool, &live, dir.path(), None).await;
+        let (audio_tx, audio_rx) = mpsc::channel(2);
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(recorder.run(audio_rx, events_rx));
+
+        pool.close().await;
+        // Puts the recorder into its ~2.1 s retry path.
+        events_tx.send(commit("lost", 0, 100)).unwrap();
+        events_tx.send(RecorderEvent::EndOfSegment).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Far more frames than the channel holds: each send only completes if
+        // audio is being drained while the retries run.
+        tokio::time::timeout(Duration::from_millis(1_000), async {
+            for _ in 0..20 {
+                audio_tx.send(Bytes::from(vec![7u8; 3_200])).await.unwrap();
+            }
+        })
+        .await
+        .expect("audio must not wait on Postgres retries");
+
+        drop(audio_tx);
+        drop(events_tx);
+        task.await.unwrap();
+        let audio = tokio::fs::read(sessions::recording_path(dir.path(), sid, rec_id))
+            .await
+            .unwrap();
+        assert_eq!(audio.len(), 20 * 3_200);
     }
 }
