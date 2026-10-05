@@ -38,6 +38,7 @@ export class LiveSession {
   private finished = false;
   private attempt = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  private stopTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly buffer = new FrameBuffer(OFFLINE_BUFFER_BYTES);
 
   constructor(
@@ -99,7 +100,14 @@ export class LiveSession {
       ws.send(JSON.stringify({ type: 'stop' }));
       this.cb.status('stopping');
       // The server answers with `done` and closes; don't hang if it never does.
-      setTimeout(() => ws.close(), STOP_TIMEOUT_MS);
+      this.stopTimer = setTimeout(() => {
+        this.stopTimer = null;
+        if (this.finished) return;
+        ws.onclose = null;
+        ws.onmessage = null;
+        ws.close();
+        this.finish();
+      }, STOP_TIMEOUT_MS);
     } else {
       if (ws) {
         ws.onclose = null;
@@ -206,6 +214,10 @@ export class LiveSession {
   private finish(): void {
     if (this.finished) return;
     this.finished = true;
+    if (this.stopTimer) {
+      clearTimeout(this.stopTimer);
+      this.stopTimer = null;
+    }
     this.ws = null;
     this.cb.status('idle');
     this.cb.ended();
