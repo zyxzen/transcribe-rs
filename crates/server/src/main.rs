@@ -3,6 +3,7 @@ mod audio;
 mod config;
 mod db;
 mod export;
+mod hosts;
 mod live;
 mod pipeline;
 mod protocol;
@@ -73,6 +74,10 @@ async fn main() -> Result<()> {
         .route("/healthz", get(|| async { "ok" }))
         .nest("/api", api)
         .fallback_service(static_files)
+        .layer(axum::middleware::from_fn_with_state(
+            hosts::HostAllowlist::new(cfg.bind, &cfg.allowed_hosts),
+            hosts::guard,
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 

@@ -18,6 +18,14 @@ pub struct Config {
     #[arg(long, env = "TR_BIND", default_value = "127.0.0.1:8080")]
     pub bind: SocketAddr,
 
+    /// Extra hostnames accepted in the `Host` (and WebSocket `Origin`) header,
+    /// comma-separated. Loopback names and the `--bind` address are always
+    /// allowed. Only needed when serving beyond loopback (a LAN name, reverse
+    /// proxy); everything else is refused to block DNS rebinding. Per-request
+    /// header check only, no hot-path cost.
+    #[arg(long, env = "TR_ALLOWED_HOSTS", value_delimiter = ',')]
+    pub allowed_hosts: Vec<String>,
+
     /// Built browser client served at `/` (`cd client && pnpm build`).
     #[arg(long, env = "TR_CLIENT_DIR", default_value = "client/dist")]
     pub client_dir: PathBuf,
