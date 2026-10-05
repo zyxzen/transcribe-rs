@@ -264,8 +264,11 @@ async fn export_session(
         &format,
     );
 
+    let mut wav_len = None;
     let (content_type, body) = if format == "wav" {
-        ("audio/wav", wav_body(&st, id).await?)
+        let (body, len) = wav_body(&st, id).await?;
+        wav_len = Some(len);
+        ("audio/wav", body)
     } else {
         let paragraphs = export::paragraphs(&db::list_chunks(&st.db, id).await?);
         match format.as_str() {
@@ -296,7 +299,7 @@ async fn export_session(
         }
     };
 
-    Ok((
+    let mut res = (
         [
             (header::CONTENT_TYPE, content_type.to_string()),
             (
@@ -306,13 +309,17 @@ async fn export_session(
         ],
         body,
     )
-        .into_response())
+        .into_response();
+    if let Some(len) = wav_len {
+        res.headers_mut().insert(header::CONTENT_LENGTH, len.into());
+    }
+    Ok(res)
 }
 
 /// Header plus every recording's PCM, streamed in order without buffering
 /// the session in memory. Lengths are fixed up front so a live recording
 /// growing during the download cannot desync the header.
-async fn wav_body(st: &ApiState, id: Uuid) -> ApiResult<Body> {
+async fn wav_body(st: &ApiState, id: Uuid) -> ApiResult<(Body, u64)> {
     let recordings = db::list_recordings(&st.db, id).await?;
     let sample_rate = recordings.first().map_or(16_000, |r| r.sample_rate);
     if recordings.iter().any(|r| r.sample_rate != sample_rate) {
@@ -348,7 +355,7 @@ async fn wav_body(st: &ApiState, id: Uuid) -> ApiResult<Body> {
     ));
     let body = stream::once(async move { Ok::<_, std::io::Error>(header) })
         .chain(stream::iter(parts).flatten());
-    Ok(Body::from_stream(body))
+    Ok((Body::from_stream(body), 44 + total))
 }
 
 #[cfg(test)]
@@ -627,6 +634,7 @@ mod tests {
 
         let (_, headers, body) = get("wav").await;
         assert_eq!(headers["content-type"], "audio/wav");
+        assert_eq!(headers["content-length"], "96044");
         assert_eq!(body.len(), 44 + 96_000);
         assert_eq!(&body[0..4], b"RIFF");
         assert_eq!(u32::from_le_bytes(body[40..44].try_into().unwrap()), 96_000);
@@ -833,6 +841,35 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(json(&bytes)["error"]["code"], "bad_request");
+    }
+
+    #[sqlx::test(migrator = "crate::db::MIGRATOR")]
+    async fn host_guard_blocks_rebinding(pool: PgPool) {
+        let f = fixture(pool);
+        let list = crate::hosts::HostAllowlist::new("127.0.0.1:8080".parse().unwrap(), &[]);
+        let app =
+            Router::new()
+                .nest("/api", f.app.clone())
+                .layer(axum::middleware::from_fn_with_state(
+                    list,
+                    crate::hosts::guard,
+                ));
+        let get = |host: Option<&'static str>| {
+            let mut req = Request::builder().uri("/api/sessions");
+            if let Some(h) = host {
+                req = req.header("host", h);
+            }
+            app.clone().oneshot(req.body(Body::empty()).unwrap())
+        };
+        let res = get(Some("evil.example")).await.unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(json(&bytes)["error"]["code"], "forbidden_host");
+        assert_eq!(get(None).await.unwrap().status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            get(Some("127.0.0.1:8080")).await.unwrap().status(),
+            StatusCode::OK
+        );
     }
 
     #[sqlx::test(migrator = "crate::db::MIGRATOR")]
