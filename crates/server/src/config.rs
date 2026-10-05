@@ -18,8 +18,8 @@ pub struct Config {
     #[arg(long, env = "TR_BIND", default_value = "127.0.0.1:8080")]
     pub bind: SocketAddr,
 
-    /// Directory served at `/` (the browser client).
-    #[arg(long, env = "TR_CLIENT_DIR", default_value = "client")]
+    /// Built browser client served at `/` (`cd client && pnpm build`).
+    #[arg(long, env = "TR_CLIENT_DIR", default_value = "client/dist")]
     pub client_dir: PathBuf,
 
     /// Postgres connection string for session storage.
