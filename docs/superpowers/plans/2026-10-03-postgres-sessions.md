@@ -20,6 +20,7 @@
 | `GET /api/sessions/:id/export.{ext}` | **`GET /api/sessions/{id}/export/{format}`** | axum 0.8.4's router (matchit 0.8.4) cannot capture part of a path segment. The download filename still comes from `Content-Disposition`. |
 | `createdb transcribe_rust_test` | **not needed** | `#[sqlx::test]` creates and drops a throwaway database per test on the server `DATABASE_URL` points at. |
 | `.sqlx/` committed + `cargo build` offline | Same, **plus** `DATABASE_URL` must be exported when running `cargo test` | `#[sqlx::test]` reads `DATABASE_URL` from the process environment at run time. |
+| sqlx with `tls-rustls` | **No TLS feature** | Local Postgres only; `sslmode=require` URLs are unsupported in this build. Add `tls-rustls` when a remote database is needed. |
 
 ## Global Constraints
 

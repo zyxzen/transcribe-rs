@@ -22,7 +22,7 @@ cargo test                                      # includes #[sqlx::test] DB test
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 cargo sqlx prepare --workspace                  # after ANY SQL change; commit .sqlx/
-cargo sqlx migrate add -r <name> --source crates/server/migrations   # new migration
+cargo sqlx migrate add <name> --source crates/server/migrations   # new migration
 cd client && pnpm dev                           # :5173, proxies /api and /ws to :8080
 cd client && pnpm build                         # server serves client/dist
 cd client && pnpm typecheck && pnpm lint && pnpm test

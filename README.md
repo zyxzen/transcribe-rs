@@ -104,6 +104,8 @@ cp .env.example .env        # DATABASE_URL=postgres://localhost/transcribe_rust
 ```
 
 `DATABASE_URL` is required (there is no default); `.env` is loaded if present.
+This build has no Postgres TLS support: use a local (or otherwise trusted-network)
+Postgres; `sslmode=require` URLs are not supported.
 Migrations run automatically when the server starts.
 
 ### 3. Build and run
@@ -219,6 +221,13 @@ Errors are JSON: `{"error":{"code":"…","message":"…"}}`. That includes
 > There is no authentication. The server binds to `127.0.0.1` by default; if
 > you bind it to another interface, anyone who can reach it can read and
 > delete every session.
+>
+> Requests are also checked against a `Host` allowlist (loopback names, the
+> `--bind` address, plus `--allowed-hosts` / `TR_ALLOWED_HOSTS`, comma-separated)
+> and `/ws` against `Origin` when the browser sends one; anything else gets
+> `403` (`forbidden_host` / `forbidden_origin`). This blocks DNS rebinding and
+> cross-site WebSockets. You only need to set it when serving under another
+> name (LAN hostname, reverse proxy).
 
 ## Architecture
 

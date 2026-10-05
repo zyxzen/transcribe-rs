@@ -12,7 +12,7 @@ export function SessionsPage() {
     queryFn: ({ pageParam }) => api.listSessions(pageParam),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (last) => (last.length === PAGE_SIZE ? last.at(-1)?.id : undefined),
-    // Keep live badges and growing durations current.
+    // Keep live badges current (durations only change when a recording closes).
     refetchInterval: (query) => (query.state.data?.pages.some((p) => p.some((s) => s.live)) ? 3000 : false),
   });
   const remove = useMutation({
