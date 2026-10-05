@@ -47,7 +47,7 @@ One WebSocket at `/ws`, bidirectional.
 **Client → server.** A JSON handshake first, then binary frames:
 
 ```json
-{"type":"start","sampleRate":16000,"encoding":"pcm_s16le","language":"en"}
+{"type":"start","sampleRate":16000,"encoding":"pcm_s16le","language":"en","sessionId":"0192…"}
 ```
 
 followed by raw little-endian Int16 mono PCM, ~100–250 ms per frame. Frame
@@ -57,7 +57,7 @@ stream cleanly.
 **Server → client.** Text frames only:
 
 ```json
-{"type":"ready"}
+{"type":"ready","sessionId":"0192…","resumed":true,"offsetMs":84210}
 {"type":"transcript","seq":7,"commit":{"text":"hello there","start":120,"end":940},"pending":"how are","endOfSegment":false,"language":"en"}
 {"type":"transcript","seq":8,"pending":"how are you","endOfSegment":false,"language":"en"}
 {"type":"error","code":"decode_failed","message":"..."}
@@ -69,6 +69,16 @@ stream cleanly.
 - `pending` is always present and has **replace** semantics.
 - `endOfSegment: true` means the utterance ended — render a paragraph break.
 - Timestamps are absolute milliseconds from stream start.
+- `sessionId` in `start` is optional. Without it the server creates a session;
+  with it the server resumes that session (waiting up to 5 s for a previous
+  connection on it to finish), or replies `session_not_found` / `session_busy`.
+- `ready.offsetMs` is where this connection starts on the session timeline.
+  Wire timestamps stay relative to the connection's own stream.
+- `{"type":"error","code":"persist_failed"}` means Postgres is unreachable;
+  transcription continues and audio is still written to disk.
+- The server pings every 15 s and closes a socket that has been silent for 45 s.
+- The server closes the socket only after the recorder has released the
+  session, so `done` followed by close happens after the final save.
 
 ## Running it
 
@@ -84,9 +94,23 @@ curl -L -o models/ggml-base.en-q5_1.bin \
 accurate and roughly 3× the compute — swap it in with `--model` once you've
 measured RTF on your hardware.
 
-### 2. Build and run
+### 2. Database
+
+Sessions are stored in Postgres (transcript) and under `data/` (audio).
 
 ```sh
+createdb transcribe_rust
+cp .env.example .env        # DATABASE_URL=postgres://localhost/transcribe_rust
+```
+
+`DATABASE_URL` is required (there is no default); `.env` is loaded if present.
+Migrations run automatically when the server starts.
+
+### 3. Build and run
+
+```sh
+(cd client && pnpm install && pnpm build)   # the server serves client/dist
+
 # macOS (Metal)
 cargo run --release --features metal -- --model models/ggml-base.en-q5_1.bin
 
@@ -96,6 +120,12 @@ cargo run --release --features cuda -- --model models/ggml-base.en-q5_1.bin
 # CPU only
 cargo run --release -- --model models/ggml-base.en-q5_1.bin
 ```
+
+Run the server from the repo root: `--client-dir` defaults to the relative path
+`client/dist`, so the client must be built before it will be served.
+
+For client development, run the server as above and `cd client && pnpm dev`,
+then open <http://localhost:5173> (Vite proxies `/api` and `/ws` to :8080).
 
 Building whisper-rs compiles whisper.cpp, so the first build needs `cmake` and a
 C++ toolchain and takes a few minutes.
@@ -158,33 +188,81 @@ roughly 3 concurrent streams per worker. Measure your own: run with
 builds decodes are far slower and `--max-connections` should come down
 accordingly.
 
+## Sessions
+
+Every connection records into a session. A session has one or more
+*recordings* (one per connection: the first, plus one per resume), laid end to
+end on a single timeline, so exported subtitles line up with exported audio.
+
+| Store | What |
+|---|---|
+| Postgres `sessions`, `recordings`, `transcript_chunks` | metadata and every committed chunk, with session-timeline timestamps |
+| `data/sessions/{session}/{recording}.pcm` | raw 16 kHz Int16 mono, exactly as received; append-only, so crash-safe |
+
+A recording left open by a crash is repaired from its file size the next time
+the session is resumed or exported.
+
+### REST API
+
+| Method | Path | |
+|---|---|---|
+| GET | `/api/sessions?limit=50&before=<id>` | newest first, keyset paging |
+| GET | `/api/sessions/{id}` | metadata, recordings, paragraphs |
+| PATCH | `/api/sessions/{id}` | `{"title": "…" \| null}` |
+| DELETE | `/api/sessions/{id}` | `409 session_live` while recording |
+| GET | `/api/sessions/{id}/export/{txt\|srt\|vtt\|json\|wav}` | download |
+
+Errors are JSON: `{"error":{"code":"…","message":"…"}}`. That includes
+`400 bad_request` for malformed ids or bodies and a JSON `404` for unknown
+`/api` paths.
+
+> There is no authentication. The server binds to `127.0.0.1` by default; if
+> you bind it to another interface, anyone who can reach it can read and
+> delete every session.
+
 ## Architecture
 
 ```
 crates/server/src/
-  main.rs         wiring, static file serving, graceful shutdown
-  ws.rs           axum handler; 3 tasks per connection + admission control
+  main.rs         wiring, DB connect, static file serving, graceful shutdown
+  ws.rs           axum handler; 4 tasks per connection + admission control
   pipeline.rs     VAD, rolling buffer, latest-wins scheduling, emission
+  recorder.rs     per-connection persistence: PCM file + batched chunk inserts
+  sessions.rs     open/resume a session, audio file layout, crash repair
+  live.rs         in-memory "which sessions have a socket" registry
+  db.rs           every SQL query (sqlx, compile-checked)
+  api.rs          REST API
+  export.rs       txt / srt / vtt / json / wav formatting
   vad.rs          Silero VAD over fixed 32 ms frames
   stabilizer.rs   LocalAgreement-2
   whisper.rs      blocking inference pool
   audio.rs        Int16 -> f32, optional resampling
   protocol.rs     serde types for the wire protocol
   config.rs       CLI / env configuration
-client/
-  index.html      UI + WebSocket client
-  audio-worklet.js  capture, downsample to 16 kHz, Int16 framing
+crates/server/migrations/   SQL migrations, applied on boot
+client/                     Vite + React + TypeScript
+  src/transcript/   reducer, reconnect helpers, LiveSession (mic + socket)
+  src/pages/        recorder, session list, session detail
+  public/audio-worklet.js   capture, downsample to 16 kHz, Int16 framing
 ```
 
-Per connection, three concurrent tasks:
+Per connection, four concurrent tasks:
 
-1. **Receiver** — WebSocket binary frames → `mpsc` to the pipeline. The channel
-   is bounded, so a slow pipeline backpressures the socket rather than dropping
-   audio.
+1. **Receiver** — WebSocket binary frames → `mpsc` to the pipeline *and* to the
+   recorder. Both channels are bounded and awaited, so a slow consumer
+   backpressures the socket rather than dropping audio.
 2. **Pipeline** — resample if needed → VAD → maintain the active buffer (audio
    since the last commit) → schedule decodes latest-wins → LocalAgreement-2 →
-   emit transcript JSON.
-3. **Sender** — `mpsc` of transcript messages → WebSocket text frames.
+   emit transcript JSON, and forward each commit to the recorder over an
+   unbounded channel, so persistence can never stall decoding.
+3. **Sender** — `mpsc` of transcript messages → WebSocket text frames, plus a
+   ping every 15 s.
+4. **Recorder** — appends audio to the recording's PCM file and writes commits
+   to Postgres in batches (every 500 ms, 32 rows, or end of utterance). It
+   drains audio in its own internal writer task, so Postgres retries never hold
+   up audio and therefore never stall transcription. On close it records the
+   duration and releases the session for the next connection; the server closes
+   the socket only after that.
 
 ### Stabilization: LocalAgreement-2
 
@@ -240,10 +318,13 @@ jobs you throw at it. So:
 ## Tests
 
 ```sh
-cargo test
+export DATABASE_URL=postgres://localhost/transcribe_rust
+cargo test                       # DB tests create a throwaway database each
+(cd client && pnpm test)
 ```
 
-Unit tests cover protocol serialization, the LocalAgreement-2 state machine
-(including the shrinking-hypothesis and re-punctuation edge cases), PCM
-conversion and resampling ratios. The VAD test exercises the bundled Silero
-model.
+Server unit tests cover protocol serialization, the LocalAgreement-2 state
+machine, PCM conversion and resampling, the live registry and every export
+format. `#[sqlx::test]` integration tests cover the recorder, session resume and
+crash repair, and the REST API. Client tests cover the transcript reducer and
+reconnect helpers. The VAD test exercises the bundled Silero model.
