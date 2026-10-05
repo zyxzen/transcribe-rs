@@ -62,6 +62,8 @@ export function useTranscriber() {
           setNotice('That session no longer exists. Press start for a new one.');
         } else if (code === 'session_busy') {
           if (terminal) setNotice('This session is recording in another tab.');
+        } else if (code === 'connect_failed') {
+          setNotice(`${message} Check that it is running, then press start.`);
         } else if (code === 'persist_failed') {
           setNotice('Transcript is not being saved right now; retrying.');
         } else {

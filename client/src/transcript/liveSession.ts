@@ -4,6 +4,15 @@ import { backoffDelay, FrameBuffer, OFFLINE_BUFFER_BYTES } from './reconnect';
 const TARGET_RATE = 16_000;
 /** How long Stop waits for the server's `done` before closing anyway. */
 const STOP_TIMEOUT_MS = 5_000;
+/** Server errors that retrying cannot fix (bad handshake, refused origin/host). */
+const TERMINAL_CODES = new Set([
+  'session_not_found',
+  'init_failed',
+  'bad_handshake',
+  'unsupported_encoding',
+  'forbidden_origin',
+  'forbidden_host',
+]);
 
 export type TranscriberStatus = 'idle' | 'starting' | 'connecting' | 'live' | 'reconnecting' | 'stopping';
 
@@ -153,10 +162,11 @@ export class LiveSession {
           this.cb.transcript(msg);
           break;
         case 'error': {
-          // A missing session never comes back; a busy one is worth retrying
+          // These never succeed on retry. A busy session is worth retrying
           // only if we were already recording into it (we raced our own
           // previous connection's flush).
-          const terminal = msg.code === 'session_not_found' || (msg.code === 'session_busy' && !this.everReady);
+          const terminal =
+            TERMINAL_CODES.has(msg.code) || (msg.code === 'session_busy' && !this.everReady);
           if (terminal) this.terminal = true;
           this.cb.serverError(msg.code, msg.message, terminal);
           break;
@@ -170,6 +180,12 @@ export class LiveSession {
       if (this.ws !== ws) return;
       this.ws = null;
       this.ready = false;
+      // Never reached `ready`: the server is down or refused the upgrade (a
+      // 403 for a bad Origin/Host surfaces only as a bare close). Don't loop.
+      if (!this.everReady && !this.stopped && !this.terminal) {
+        this.terminal = true;
+        this.cb.serverError('connect_failed', 'Could not connect to the server.', true);
+      }
       if (this.stopped || this.terminal) {
         this.teardownAudio();
         this.finish();
