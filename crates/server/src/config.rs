@@ -22,6 +22,18 @@ pub struct Config {
     #[arg(long, env = "TR_CLIENT_DIR", default_value = "client")]
     pub client_dir: PathBuf,
 
+    /// Postgres connection string for session storage.
+    #[arg(long, env = "DATABASE_URL")]
+    pub database_url: String,
+
+    /// Root for persisted audio: `{data_dir}/sessions/{session}/{recording}.pcm`.
+    #[arg(long, env = "TR_DATA_DIR", default_value = "data")]
+    pub data_dir: PathBuf,
+
+    /// Postgres pool size. Writes are batched per connection, so this stays small.
+    #[arg(long, env = "TR_DB_MAX_CONNECTIONS", default_value_t = 8)]
+    pub db_max_connections: u32,
+
     /// Number of blocking inference workers (concurrent decodes).
     ///
     /// A GPU serializes decodes, so 1-2 is right there. On CPU, use

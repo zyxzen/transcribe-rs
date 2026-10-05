@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE sessions\n         SET duration_ms = (SELECT coalesce(sum(duration_ms), 0)::int8 FROM recordings WHERE session_id = $1),\n             updated_at = now()\n         WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "68ad776920a46d8c0a692bed391208b58862f3ba86b87f031322793d10421051"
+}

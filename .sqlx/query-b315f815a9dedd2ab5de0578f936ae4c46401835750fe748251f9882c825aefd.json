@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE recordings SET duration_ms = $2, ended_at = coalesce(ended_at, now())\n         WHERE id = $1 RETURNING session_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "session_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b315f815a9dedd2ab5de0578f936ae4c46401835750fe748251f9882c825aefd"
+}

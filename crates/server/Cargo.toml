@@ -7,14 +7,21 @@ description = "Near-realtime Whisper transcription server over WebSocket"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal", "fs", "io-util"] }
 tower-http = { version = "0.6", features = ["fs", "trace"] }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 crossbeam-channel = "0.5"
+
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "postgres", "uuid", "chrono", "migrate", "macros"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+tokio-util = { version = "0.7", features = ["rt", "io"] }
+bytes = "1"
+dotenvy = "0.15"
 
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
@@ -24,6 +31,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 whisper-rs = "0.16"
 voice_activity_detector = "0.2"
 rubato = "0.16"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "macros", "rt-multi-thread"] }
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [features]
 default = []

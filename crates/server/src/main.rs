@@ -1,5 +1,6 @@
 mod audio;
 mod config;
+mod db;
 mod pipeline;
 mod protocol;
 mod stabilizer;
@@ -22,6 +23,9 @@ use crate::ws::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // `.env` is optional; real environment variables take precedence.
+    let _ = dotenvy::dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -30,6 +34,12 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Arc::new(Config::parse());
+
+    // Fail fast on a bad database before the multi-second model load.
+    let _db = db::connect(&cfg.database_url, cfg.db_max_connections).await?;
+    tokio::fs::create_dir_all(cfg.data_dir.join("sessions"))
+        .await
+        .with_context(|| format!("creating {}", cfg.data_dir.display()))?;
 
     // Blocking work: model load + one warm-up inference per worker. Done before
     // we accept any traffic so the first utterance isn't slow.
