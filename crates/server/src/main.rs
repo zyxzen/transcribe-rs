@@ -1,6 +1,7 @@
 mod audio;
 mod config;
 mod db;
+mod live;
 mod pipeline;
 mod protocol;
 mod stabilizer;
