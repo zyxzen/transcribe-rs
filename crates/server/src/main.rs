@@ -24,6 +24,8 @@ use crate::config::Config;
 use crate::whisper::WhisperEngine;
 use crate::ws::AppState;
 
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // `.env` is optional; real environment variables take precedence.
@@ -39,7 +41,7 @@ async fn main() -> Result<()> {
     let cfg = Arc::new(Config::parse());
 
     // Fail fast on a bad database before the multi-second model load.
-    let _db = db::connect(&cfg.database_url, cfg.db_max_connections).await?;
+    let db = db::connect(&cfg.database_url, cfg.db_max_connections).await?;
     tokio::fs::create_dir_all(cfg.data_dir.join("sessions"))
         .await
         .with_context(|| format!("creating {}", cfg.data_dir.display()))?;
@@ -53,7 +55,7 @@ async fn main() -> Result<()> {
             .context("engine init panicked")??
     };
 
-    let state = AppState::new(Arc::clone(&cfg), Arc::clone(&engine));
+    let state = AppState::new(Arc::clone(&cfg), Arc::clone(&engine), db.clone());
 
     let index = cfg.client_dir.join("index.html");
     let static_files = ServeDir::new(&cfg.client_dir).fallback(ServeFile::new(index));
@@ -63,7 +65,7 @@ async fn main() -> Result<()> {
         .route("/healthz", get(|| async { "ok" }))
         .fallback_service(static_files)
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(cfg.bind)
         .await
@@ -78,9 +80,25 @@ async fn main() -> Result<()> {
     );
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown({
+            let token = state.shutdown.clone();
+            async move {
+                shutdown_signal().await;
+                token.cancel();
+            }
+        })
         .await
         .context("server error")?;
+
+    // Upgraded sockets outlive axum's graceful shutdown; give their pipelines
+    // and recorders a bounded window to flush.
+    state.tracker.close();
+    if tokio::time::timeout(SHUTDOWN_GRACE, state.tracker.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!("shutdown grace elapsed with streams still open");
+    }
 
     Ok(())
 }

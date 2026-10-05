@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use crate::audio::{self, Resampler, TARGET_SAMPLE_RATE};
 use crate::config::Config;
 use crate::protocol::{ServerMessage, StartParams};
+use crate::recorder::RecorderEvent;
 use crate::stabilizer::{Outcome, Stabilizer};
 use crate::vad::{Vad, VAD_CHUNK, VAD_CHUNK_MS};
 use crate::whisper::{Hypothesis, WhisperEngine};
@@ -35,6 +36,9 @@ pub struct Pipeline {
     engine: Arc<WhisperEngine>,
     language: String,
     out: mpsc::Sender<ServerMessage>,
+    /// Persistence feed. Unbounded on purpose: the pipeline must never wait
+    /// on the database.
+    recorder: mpsc::UnboundedSender<RecorderEvent>,
 
     resampler: Option<Resampler>,
     odd_byte: Option<u8>,
@@ -74,6 +78,7 @@ impl Pipeline {
         engine: Arc<WhisperEngine>,
         params: &StartParams,
         out: mpsc::Sender<ServerMessage>,
+        recorder: mpsc::UnboundedSender<RecorderEvent>,
     ) -> Result<Self> {
         let resampler = Resampler::new(params.sample_rate, TARGET_SAMPLE_RATE)?;
         if resampler.is_some() {
@@ -110,6 +115,7 @@ impl Pipeline {
             cfg,
             engine,
             out,
+            recorder,
         })
     }
 
@@ -409,6 +415,17 @@ impl Pipeline {
             // Nothing was said in this segment — don't emit an empty paragraph
             // break.
             return;
+        }
+
+        if let Some(commit) = &outcome.commit {
+            let _ = self.recorder.send(RecorderEvent::Commit {
+                text: commit.text.clone(),
+                start_ms: commit.start,
+                end_ms: commit.end,
+            });
+        }
+        if end_of_segment {
+            let _ = self.recorder.send(RecorderEvent::EndOfSegment);
         }
 
         self.seq += 1;

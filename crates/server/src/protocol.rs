@@ -4,6 +4,7 @@
 //! Server -> client: JSON Text frames only.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 /// Control messages the client may send as Text frames.
 #[derive(Debug, Clone, Deserialize)]
@@ -23,6 +24,9 @@ pub struct StartParams {
     pub encoding: String,
     #[serde(default)]
     pub language: Option<String>,
+    /// Resume this session instead of creating a new one.
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
 }
 
 impl Default for StartParams {
@@ -31,6 +35,7 @@ impl Default for StartParams {
             sample_rate: default_sample_rate(),
             encoding: default_encoding(),
             language: None,
+            session_id: None,
         }
     }
 }
@@ -68,7 +73,14 @@ pub struct Commit {
 )]
 pub enum ServerMessage {
     /// Handshake accepted, model warm, start sending audio.
-    Ready,
+    Ready {
+        session_id: Uuid,
+        /// True when this connection continues an existing session.
+        resumed: bool,
+        /// Where this connection starts on the session timeline. Wire
+        /// timestamps stay relative to this connection's stream.
+        offset_ms: i64,
+    },
     Transcript {
         seq: u64,
         /// Omitted on ticks that produced no new committed text.
@@ -129,5 +141,49 @@ mod tests {
         .unwrap();
         assert!(!json.contains("commit"));
         assert!(json.contains(r#""endOfSegment":false"#));
+    }
+
+    #[test]
+    fn start_accepts_optional_session_id() {
+        let with: ClientMessage = serde_json::from_str(
+            r#"{"type":"start","sessionId":"0192f0c1-0000-7000-8000-000000000001"}"#,
+        )
+        .unwrap();
+        let ClientMessage::Start(p) = with else {
+            panic!("expected start")
+        };
+        assert_eq!(
+            p.session_id.map(|u| u.to_string()).as_deref(),
+            Some("0192f0c1-0000-7000-8000-000000000001")
+        );
+
+        let without: ClientMessage = serde_json::from_str(r#"{"type":"start"}"#).unwrap();
+        let ClientMessage::Start(p) = without else {
+            panic!("expected start")
+        };
+        assert!(p.session_id.is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_session_id() {
+        assert!(
+            serde_json::from_str::<ClientMessage>(r#"{"type":"start","sessionId":"nope"}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ready_carries_session_fields() {
+        let id: uuid::Uuid = "0192f0c1-0000-7000-8000-000000000001".parse().unwrap();
+        let json = serde_json::to_string(&ServerMessage::Ready {
+            session_id: id,
+            resumed: true,
+            offset_ms: 1_500,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"type":"ready","sessionId":"0192f0c1-0000-7000-8000-000000000001","resumed":true,"offsetMs":1500}"#
+        );
     }
 }
