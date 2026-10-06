@@ -41,6 +41,7 @@ so run the server from the repo root and `cd client && pnpm build` first.
 ```
 crates/server/src/
   main.rs         wiring, DB connect, static file serving, graceful shutdown
+  hosts.rs        Host / Origin allowlist middleware (DNS rebinding, cross-site WS)
   ws.rs           axum handler; 4 tasks per connection + admission control
   pipeline.rs     VAD, rolling buffer, latest-wins scheduling, emission
   recorder.rs     per-connection persistence: PCM file + batched chunk inserts
@@ -57,8 +58,12 @@ crates/server/src/
   config.rs       CLI / env configuration
 crates/server/migrations/   SQL migrations, applied on boot
 client/                     Vite + React + TypeScript
+  src/protocol.ts   wire types, mirrored by hand from protocol.rs
+  src/api.ts        REST client (TanStack Query)
   src/transcript/   reducer, reconnect helpers, LiveSession (mic + socket)
+  src/hooks/        useTranscriber, level meter, auto-scroll
   src/pages/        recorder, session list, session detail
+  src/components/   transcript view, title editor, export menu
   public/audio-worklet.js   capture, downsample to 16 kHz, Int16 framing
 ```
 
@@ -92,6 +97,8 @@ client/                     Vite + React + TypeScript
   changing SQL run `cargo sqlx prepare --workspace` and commit `.sqlx/`.
 - Admission control (`--max-connections`) rejects with 503 rather than degrading
   existing streams.
+- **Every route sits behind the `hosts.rs` allowlist** (`Host`, plus `Origin`
+  on `/ws`). The server has no auth; don't mount anything outside that layer.
 
 ## Conventions
 

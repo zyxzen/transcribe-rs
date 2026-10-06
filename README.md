@@ -74,8 +74,17 @@ stream cleanly.
   connection on it to finish), or replies `session_not_found` / `session_busy`.
 - `ready.offsetMs` is where this connection starts on the session timeline.
   Wire timestamps stay relative to the connection's own stream.
-- `{"type":"error","code":"persist_failed"}` means Postgres is unreachable;
-  transcription continues and audio is still written to disk.
+- Error codes:
+
+  | Code | Meaning | Closes socket |
+  |---|---|---|
+  | `bad_handshake` / `handshake_timeout` | first frame wasn't a valid `start` | yes |
+  | `unsupported_encoding` | `encoding` other than `pcm_s16le` | yes |
+  | `session_not_found` / `session_busy` | resume target missing, or still live elsewhere | yes |
+  | `init_failed` | server couldn't open the session or its audio file | yes |
+  | `bad_control` | unparseable control message after `start` | no |
+  | `decode_failed` | one decode pass failed and was dropped; streaming continues | no |
+  | `persist_failed` | Postgres unreachable; transcription continues and audio is still written to disk | no |
 - The server pings every 15 s and closes a socket that has been silent for 45 s.
 - The server closes the socket only after the recorder has released the
   session, so `done` followed by close happens after the final save.
@@ -132,9 +141,16 @@ then open <http://localhost:5173> (Vite proxies `/api` and `/ws` to :8080).
 Building whisper-rs compiles whisper.cpp, so the first build needs `cmake` and a
 C++ toolchain and takes a few minutes.
 
-Then open <http://127.0.0.1:8080> and click **Start**. Committed text renders
+Then open <http://127.0.0.1:8080> and press the mic. Committed text renders
 solid; the pending hypothesis renders grey and italic. The status line shows
-measured time-to-first-text.
+measured time-to-first-text. Stopping keeps the session on screen; pressing
+again continues it as a new recording. **Past sessions** (`/sessions`) lists
+everything recorded, with rename, export and delete on each session's page.
+
+To check the socket without a browser, run `node scripts/smoke-ws.mjs` (Node 24)
+against a running server: it opens a session, streams 2 s of silence and prints
+every server message. Pass a session id to exercise resume; `WS_URL` overrides
+the endpoint. `GET /healthz` returns `ok`.
 
 > The browser only grants microphone access on a secure origin. `localhost`
 > counts. To reach the server from another machine, put it behind TLS.
@@ -156,6 +172,8 @@ touching first:
 | `--trim-context-ms` | 1000 | Committed audio kept after a trim, as context |
 | `--workers` | 1 on GPU | Concurrent decodes |
 | `--threads` | 2 on GPU | whisper.cpp threads per decode |
+| `--preroll-ms` | 300 | Audio kept before speech onset so word onsets aren't clipped |
+| `--max-segment-ms` | 24000 | Forces a flush on a run-on utterance (Whisper's window is 30 s) |
 | `--max-connections` | 4 | Admission control; see below |
 
 Don't take `--trim-context-ms` below ~1s. Whisper drops words near the edge of a
@@ -167,10 +185,24 @@ governed by `--min-decode-ms` — and it starts fragmenting the hypothesis
 (`"this is a- test- of near-"`), because each pass sees too little new audio to
 extend a word cleanly.
 
+Deployment settings also read from the environment (`.env` included):
+
+| Flag | Env | Default |
+|---|---|---|
+| `--model` | `TR_MODEL` | `models/ggml-base.en-q5_1.bin` |
+| `--bind` | `TR_BIND` | `127.0.0.1:8080` |
+| `--allowed-hosts` | `TR_ALLOWED_HOSTS` | (none; see [REST API](#rest-api)) |
+| `--client-dir` | `TR_CLIENT_DIR` | `client/dist` |
+| `--database-url` | `DATABASE_URL` | required |
+| `--data-dir` | `TR_DATA_DIR` | `data` |
+| `--db-max-connections` | `TR_DB_MAX_CONNECTIONS` | 8 |
+| `--workers`, `--threads`, `--flash-attn`, `--max-connections` | `TR_WORKERS`, `TR_THREADS`, `TR_FLASH_ATTN`, `TR_MAX_CONNECTIONS` | as above |
+
 ### Measured
 
 M-series Mac, Metal, `base.en-q5_1`, one worker, audio fed at realtime pace.
-Median of 3 runs, measured from speech onset by `bench.py`:
+Median of 3 runs, measured from speech onset by a realtime-paced benchmark
+harness (not checked in):
 
 | Config | First text | Median decode |
 |---|---|---|
@@ -215,8 +247,9 @@ the session is resumed or exported.
 | GET | `/api/sessions/{id}/export/{txt\|srt\|vtt\|json\|wav}` | download |
 
 Errors are JSON: `{"error":{"code":"…","message":"…"}}`. That includes
-`400 bad_request` for malformed ids or bodies and a JSON `404` for unknown
-`/api` paths.
+`400 bad_request` for malformed ids or bodies, `422 title_too_long` (titles are
+capped at 200 characters), `422 mixed_sample_rates` when a session's recordings
+can't be concatenated into one WAV, and a JSON `404` for unknown `/api` paths.
 
 > There is no authentication. The server binds to `127.0.0.1` by default; if
 > you bind it to another interface, anyone who can reach it can read and
@@ -234,6 +267,7 @@ Errors are JSON: `{"error":{"code":"…","message":"…"}}`. That includes
 ```
 crates/server/src/
   main.rs         wiring, DB connect, static file serving, graceful shutdown
+  hosts.rs        Host / Origin allowlist middleware
   ws.rs           axum handler; 4 tasks per connection + admission control
   pipeline.rs     VAD, rolling buffer, latest-wins scheduling, emission
   recorder.rs     per-connection persistence: PCM file + batched chunk inserts
@@ -250,9 +284,14 @@ crates/server/src/
   config.rs       CLI / env configuration
 crates/server/migrations/   SQL migrations, applied on boot
 client/                     Vite + React + TypeScript
+  src/protocol.ts   wire types, mirrored by hand from protocol.rs
+  src/api.ts        REST client (TanStack Query)
   src/transcript/   reducer, reconnect helpers, LiveSession (mic + socket)
+  src/hooks/        useTranscriber, level meter, auto-scroll
   src/pages/        recorder, session list, session detail
+  src/components/   transcript view, title editor, export menu
   public/audio-worklet.js   capture, downsample to 16 kHz, Int16 framing
+scripts/smoke-ws.mjs        WebSocket smoke test against a running server
 ```
 
 Per connection, four concurrent tasks:
@@ -329,11 +368,11 @@ jobs you throw at it. So:
 ```sh
 export DATABASE_URL=postgres://localhost/transcribe_rust
 cargo test                       # DB tests create a throwaway database each
-(cd client && pnpm test)
+(cd client && pnpm typecheck && pnpm lint && pnpm test)
 ```
 
 Server unit tests cover protocol serialization, the LocalAgreement-2 state
 machine, PCM conversion and resampling, the live registry and every export
 format. `#[sqlx::test]` integration tests cover the recorder, session resume and
-crash repair, and the REST API. Client tests cover the transcript reducer and
-reconnect helpers. The VAD test exercises the bundled Silero model.
+crash repair, and the REST API. Client tests cover the transcript reducer,
+reconnect helpers, wire-protocol parsing and formatting. The VAD test exercises the bundled Silero model.
